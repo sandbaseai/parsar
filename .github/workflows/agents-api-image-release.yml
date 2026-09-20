@@ -1,0 +1,154 @@
+# Build and push the standalone Agents API (Core) image to a private registry.
+#
+# This is fork-local operator tooling: upstream publishes no Core image, and the
+# image contains only the four independently built static executables produced by
+# scripts/build-agents-api.sh. The workflow reuses that existing source boundary
+# through scripts/build-agents-api-image.sh instead of reimplementing the build.
+#
+# Output: <registry>/<namespace>/agents-api:<short-sha> plus its immutable digest.
+# Deploy by digest, never by a mutable tag.
+#
+# Publishes to the same Tencent CCR test registry and namespace that
+# sandbase-monorepo already uses, with secrets.CCR_USERNAME / CCR_PASSWORD.
+# Override the registry only to publish elsewhere (for example the prod
+# sgccr host).
+#
+# No Core caller key, model credential, E2B key or kubeconfig is used here.
+name: agents-api image
+
+on:
+  workflow_dispatch:
+    inputs:
+      registry:
+        description: "Registry host"
+        required: false
+        default: useccr.ccs.tencentyun.com
+        type: string
+      namespace:
+        description: "Registry namespace"
+        required: false
+        default: sandbase
+        type: string
+      push:
+        description: "Push to the registry"
+        required: false
+        default: true
+        type: boolean
+  pull_request:
+    paths:
+      - "services/agents-api/**"
+      - "contracts/agents-api/v1/**"
+      - "internal/agentdaemon/**"
+      - "internal/agentskill/**"
+      - "internal/obs/log/**"
+      - "go.mod"
+      - "go.sum"
+      - "scripts/build-agents-api.sh"
+      - "scripts/build-agents-api-image.sh"
+      - ".github/workflows/agents-api-image-release.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agents-api-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    # The image is linux/amd64 only; build it on a native amd64 runner.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PARSAR_HOME: ${{ github.workspace }}/.parsar
+      REGISTRY: ${{ inputs.registry || 'useccr.ccs.tencentyun.com' }}
+      NAMESPACE: ${{ inputs.namespace || 'sandbase' }}
+      # A pull request never publishes.
+      PUSH: ${{ github.event_name == 'workflow_dispatch' && inputs.push && 'true' || 'false' }}
+    steps:
+      - name: Require an amd64 runner
+        run: |
+          set -euo pipefail
+          test "$(uname -s)/$(uname -m)" = "Linux/x86_64" \
+            || { echo "This build requires a Linux x86_64 runner." >&2; exit 1; }
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve the image reference
+        id: reference
+        run: |
+          set -euo pipefail
+          if [ "$PUSH" = "true" ]; then
+            repository="$REGISTRY/$NAMESPACE/agents-api"
+          else
+            repository="agents-api"
+          fi
+          echo "repository=$repository" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to the registry
+        if: env.PUSH == 'true'
+        env:
+          CCR_USERNAME: ${{ secrets.CCR_USERNAME }}
+          CCR_PASSWORD: ${{ secrets.CCR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$CCR_USERNAME" && test -n "$CCR_PASSWORD" \
+            || { echo "CCR_USERNAME and CCR_PASSWORD must be configured." >&2; exit 1; }
+          # The CCR link intermittently times out its TLS handshake, as the
+          # monorepo deployment already works around.
+          for attempt in 1 2 3 4 5; do
+            if printf '%s' "$CCR_PASSWORD" \
+                | docker login "$REGISTRY" --username "$CCR_USERNAME" --password-stdin; then
+              exit 0
+            fi
+            echo "Registry login attempt $attempt failed; retrying in 10s."
+            sleep 10
+          done
+          echo "Registry login failed after 5 attempts." >&2
+          exit 1
+
+      - name: Build the image
+        env:
+          AGENTS_API_IMAGE: ${{ steps.reference.outputs.repository }}:${{ steps.reference.outputs.tag }}
+        run: ./scripts/build-agents-api-image.sh
+
+      - name: Verify the built platform
+        env:
+          IMAGE: ${{ steps.reference.outputs.repository }}:${{ steps.reference.outputs.tag }}
+        run: |
+          set -euo pipefail
+          platform="$(docker image inspect "$IMAGE" --format '{{.Os}}/{{.Architecture}}')"
+          test "$platform" = "linux/amd64" || { echo "Unexpected platform: $platform" >&2; exit 1; }
+          docker image inspect "$IMAGE" --format 'Entrypoint/Cmd: {{.Config.Entrypoint}} {{.Config.Cmd}}'
+
+      - name: Push and record the immutable digest
+        if: env.PUSH == 'true'
+        env:
+          IMAGE: ${{ steps.reference.outputs.repository }}:${{ steps.reference.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE"
+          digest="$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}')"
+          {
+            echo "### Agents API Core image"
+            echo
+            echo '```'
+            echo "tag:    $IMAGE"
+            echo "digest: $digest"
+            echo '```'
+            echo
+            echo "Deploy by digest. Configuration files (keys, managed runtimes, execution"
+            echo "options, provider keys) stay outside this image and outside GitHub."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up the registry session
+        if: always() && env.PUSH == 'true'
+        run: docker logout "$REGISTRY" || true

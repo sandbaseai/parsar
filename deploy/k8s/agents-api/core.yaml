@@ -1,0 +1,195 @@
+# Fork-local operator manifest for the standalone Agents API (Core).
+#
+# Rendered by .github/workflows/agents-api-deploy.yml. Every placeholder below is
+# supplied by that workflow, which fails on an unknown or empty one.
+#
+# Deliberate constraints, not preferences:
+#   - One replica with Recreate. Upstream states that one Core execution worker
+#     owns each database and that replicas do not provide execution HA; daemon
+#     registration and socket identity are process-local, so a second Pod would
+#     receive requests for connections it does not own.
+#   - linux/amd64 nodes only. The image and the qualified Runtime are amd64.
+#   - The image is pulled with the existing registry pull Secret; the Core image
+#     lives in the same private CCR namespace as the other services.
+#   - Managed Runtime admission (openai_hosted, including E2B) is wired only in
+#     managed mode, which needs the public https/wss entry in ingress.yaml. Without
+#     it Core serves environment:none Sessions and rejects hosted ones explicitly,
+#     rather than advertising a capability it cannot provision.
+#   - Every secret stays an in-cluster Secret created out of band by the operator.
+#     Core caller keys, model credentials and the E2B account key never enter this
+#     repository, GitHub secrets, the image or public Session configuration.
+#   - The Ingress must upgrade WebSockets on the exact daemon path and must not
+#     time out a long-lived connection: sandboxes dial back in and keep that
+#     socket for the whole lease.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: agents-api-migrate-${RELEASE}
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: agents-api
+    app.kubernetes.io/component: migrate
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agents-api
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: ${PULL_SECRET}
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: ${CORE_IMAGE}
+          command: ["/usr/local/bin/agents-api-migrate"]
+          env:
+            - name: AGENTS_API_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ${DATABASE_SECRET}
+                  key: url
+            - name: AGENTS_API_KEYS_FILE
+              value: /etc/agents-api/keys.json
+          volumeMounts:
+            - name: config
+              mountPath: /etc/agents-api
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+      volumes:
+        - name: config
+          secret:
+            secretName: ${CONFIG_SECRET}
+            defaultMode: 0400
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agents-api
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: agents-api
+    app.kubernetes.io/component: core
+spec:
+  # Execution ownership is single-writer. Do not raise this and do not attach an HPA.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agents-api
+      app.kubernetes.io/component: core
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agents-api
+        app.kubernetes.io/component: core
+      annotations:
+        # Managed Runtime configuration is read once at startup, so a Secret change
+        # requires a new Pod.
+        agents-api/config-revision: "${CONFIG_REVISION}"
+    spec:
+      imagePullSecrets:
+        - name: ${PULL_SECRET}
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agents-api
+          image: ${CORE_IMAGE}
+          ports:
+            - name: http
+              containerPort: 8091
+          env:
+            - name: AGENTS_API_ADDR
+              value: ":8091"
+            - name: AGENTS_API_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ${DATABASE_SECRET}
+                  key: url
+            - name: AGENTS_API_ENGINE
+              value: "${AGENTS_API_ENGINE}"
+            - name: AGENTS_API_KEYS_FILE
+              value: /etc/agents-api/keys.json
+            #@if MANAGED
+            # Outward URL that a sandbox daemon dials back. Core validates this path
+            # literally; TLS terminates at the Ingress.
+            - name: AGENTS_API_DAEMON_WS_URL
+              value: "wss://${CORE_HOST}/api/v1/agent-daemon/ws"
+            # Contains core_url, default_provider and the E2B entry whose
+            # api_key_file points at /etc/agents-api/e2b.key in this same Secret.
+            # Core reads it once at startup and refuses to start without the
+            # daemon URL above.
+            - name: AGENTS_API_MANAGED_RUNTIMES_FILE
+              value: /etc/agents-api/managed-runtimes.json
+            #@endif
+            - name: AGENTS_API_EXECUTION_OPTIONS_FILE
+              value: /etc/agents-api/execution-options.json
+          volumeMounts:
+            - name: config
+              mountPath: /etc/agents-api
+              readOnly: true
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            # Liveness semantics only. A ready Pod does not mean a managed Runtime
+            # can be provisioned or that execution will succeed.
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "2", memory: 1Gi }
+      volumes:
+        - name: config
+          secret:
+            secretName: ${CONFIG_SECRET}
+            defaultMode: 0400
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agents-api
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: agents-api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: agents-api
+    app.kubernetes.io/component: core
+  ports:
+    - name: http
+      port: 8091
+      targetPort: http

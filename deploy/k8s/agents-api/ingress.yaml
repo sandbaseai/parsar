@@ -1,0 +1,45 @@
+# Public entry for the Agents API (Core). Applied only once CORE_HOST exists.
+#
+# Two things depend on this file: callers reach /v1 over HTTPS, and a managed E2B
+# sandbox dials back into /api/v1/agent-daemon/ws. The E2B provider requires an
+# https core_url, so managed Runtime admission stays off until this is in place.
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agents-api
+  namespace: ${K8S_NAMESPACE}
+  annotations:
+    cert-manager.io/cluster-issuer: "${CLUSTER_ISSUER}"
+    # A sandbox daemon holds this socket for the whole lease, and a Turn can run
+    # far longer than a default proxy timeout.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "7200"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "7200"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    # Streaming creation and event SSE must not be buffered into one response.
+    nginx.ingress.kubernetes.io/proxy-body-size: "600m"
+spec:
+  ingressClassName: ${INGRESS_CLASS}
+  tls:
+    - hosts: ["${CORE_HOST}"]
+      secretName: agents-api-tls
+  rules:
+    - host: ${CORE_HOST}
+      http:
+        paths:
+          # Exact daemon gateway path first; Core validates it literally.
+          - path: /api/v1/agent-daemon/ws
+            pathType: Exact
+            backend:
+              service:
+                name: agents-api
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: agents-api
+                port:
+                  name: http

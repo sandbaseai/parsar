@@ -1,0 +1,244 @@
+# Build and push the qualified Codex managed Runtime image (linux/amd64).
+#
+# This image is the input to both managed providers:
+#   - Docker provider: referenced by immutable image ID in managed-runtimes.json
+#   - E2B provider:    packaged into a template build by
+#                      services/agents-api/deploy/e2b/build-template.py
+#
+# It is built exactly through the existing scripts, which own the source boundary:
+#   scripts/build-agents-executor.sh   Rust workspace helpers (Linux x86_64 only)
+#   scripts/build-agents-runtime.sh    daemon + pinned official Codex bundle
+#   services/agents-api/deploy/codex/Dockerfile
+#
+# The official @openai/codex@0.153.4-linux-x64 package is downloaded from npm. Pin
+# its bytes with expected_codex_sha256 once you have recorded a trusted value; the
+# first run prints the observed digest.
+#
+# The E2B template build is deliberately NOT run here: it needs the E2B account key
+# and creates billable cloud resources. This workflow prints the exact operator
+# command to run with the pushed digest.
+name: agents runtime image
+
+on:
+  workflow_dispatch:
+    inputs:
+      registry:
+        description: "Registry host"
+        required: false
+        default: useccr.ccs.tencentyun.com
+        type: string
+      namespace:
+        description: "Registry namespace"
+        required: false
+        default: sandbase
+        type: string
+      expected_codex_sha256:
+        description: "Pinned sha256 of the official Codex npm tarball (clear to accept any)"
+        required: false
+        # Observed on 2026-09-20 from npm for @openai/codex@0.153.4-linux-x64 and
+        # cross-checked against the registry sha512 integrity value. A mismatch
+        # means the bytes changed: stop and investigate rather than rebuild.
+        default: "54818cb9fce3360cc6e44cfc5a96952cd5c1243efb43cbe488e11dda84663e08"
+        type: string
+      push:
+        description: "Push to the registry"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agents-runtime-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Pinned by services/agents-api/deploy/codex: the image and the package version
+  # must match, and the Dockerfile asserts `codex-cli 0.153.4` at build time.
+  CODEX_PACKAGE: "@openai/codex@0.153.4-linux-x64"
+
+jobs:
+  image:
+    # scripts/build-agents-executor.sh refuses any host other than Linux x86_64.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PARSAR_HOME: ${{ github.workspace }}/.parsar
+      REGISTRY: ${{ inputs.registry || 'useccr.ccs.tencentyun.com' }}
+      NAMESPACE: ${{ inputs.namespace || 'sandbase' }}
+      PUSH: ${{ inputs.push && 'true' || 'false' }}
+    steps:
+      - name: Require an amd64 runner
+        run: |
+          set -euo pipefail
+          test "$(uname -s)/$(uname -m)" = "Linux/x86_64" \
+            || { echo "The executor and Runtime build require a Linux x86_64 runner." >&2; exit 1; }
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cache the Rust helper build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ github.workspace }}/.parsar/cache/executor-cargo
+            ${{ github.workspace }}/.parsar/cache/executor-target
+          key: executor-${{ runner.os }}-${{ hashFiles('packages/codex-executor/Cargo.lock', 'packages/codex-executor/rust-toolchain.toml') }}
+          restore-keys: executor-${{ runner.os }}-
+
+      - name: Resolve the image reference
+        id: reference
+        run: |
+          set -euo pipefail
+          if [ "$PUSH" = "true" ]; then
+            repository="$REGISTRY/$NAMESPACE/agents-runtime-codex"
+          else
+            repository="agents-runtime-codex"
+          fi
+          echo "repository=$repository" >> "$GITHUB_OUTPUT"
+          echo "tag=codex-0.153.4-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Download and verify the official Codex package
+        id: codex
+        env:
+          EXPECTED: ${{ inputs.expected_codex_sha256 }}
+        run: |
+          set -euo pipefail
+          work="$PARSAR_HOME/build/codex-package"
+          mkdir -p "$work"
+          cd "$work"
+          npm pack "$CODEX_PACKAGE" --json > pack.json
+          tarball="$(python3 -c 'import json;print(json.load(open("pack.json"))[0]["filename"])')"
+          observed="$(sha256sum "$tarball" | cut -d' ' -f1)"
+          echo "Observed tarball sha256: $observed"
+          # The registry's own integrity value only proves transport, so check it and
+          # keep the sha256 as the value to pin across builds.
+          python3 - "$tarball" <<'PY'
+          import base64, hashlib, json, sys
+          integrity = json.load(open('pack.json'))[0].get('integrity', '')
+          algorithm, _, expected = integrity.partition('-')
+          if algorithm not in {'sha512', 'sha256'} or not expected:
+              sys.exit('Missing npm integrity metadata')
+          digest = hashlib.new(algorithm, open(sys.argv[1], 'rb').read()).digest()
+          if base64.b64encode(digest).decode() != expected:
+              sys.exit('Codex package failed its npm integrity check')
+          print('npm integrity verified:', algorithm)
+          PY
+          if [ -n "$EXPECTED" ] && [ "$EXPECTED" != "$observed" ]; then
+            echo "Codex package digest mismatch. Expected $EXPECTED." >&2
+            exit 1
+          fi
+          tar -xzf "$tarball"
+          package="$work/package"
+          python3 - "$package/package.json" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          assert data['name'] == '@openai/codex', data['name']
+          assert data['version'] == '0.153.4-linux-x64', data['version']
+          PY
+          chmod +x "$package/vendor/x86_64-unknown-linux-musl/bin/codex"
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+          echo "sha256=$observed" >> "$GITHUB_OUTPUT"
+
+      - name: Build the Rust workspace helpers
+        run: ./scripts/build-agents-executor.sh
+
+      - name: Prepare the Runtime image context
+        env:
+          AGENTS_RUNTIME_CODEX_PACKAGE: ${{ steps.codex.outputs.package }}
+        run: ./scripts/build-agents-runtime.sh
+
+      - name: Log in to the registry
+        if: env.PUSH == 'true'
+        env:
+          CCR_USERNAME: ${{ secrets.CCR_USERNAME }}
+          CCR_PASSWORD: ${{ secrets.CCR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$CCR_USERNAME" && test -n "$CCR_PASSWORD" \
+            || { echo "CCR_USERNAME and CCR_PASSWORD must be configured." >&2; exit 1; }
+          # The CCR link intermittently times out its TLS handshake, as the
+          # monorepo deployment already works around.
+          for attempt in 1 2 3 4 5; do
+            if printf '%s' "$CCR_PASSWORD" \
+                | docker login "$REGISTRY" --username "$CCR_USERNAME" --password-stdin; then
+              exit 0
+            fi
+            echo "Registry login attempt $attempt failed; retrying in 10s."
+            sleep 10
+          done
+          echo "Registry login failed after 5 attempts." >&2
+          exit 1
+
+      - name: Build the Runtime image
+        env:
+          IMAGE: ${{ steps.reference.outputs.repository }}:${{ steps.reference.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 --tag "$IMAGE" "$PARSAR_HOME/build/agents-runtime"
+
+      - name: Verify the colocated Runtime layout
+        id: verify
+        env:
+          IMAGE: ${{ steps.reference.outputs.repository }}:${{ steps.reference.outputs.tag }}
+        run: |
+          set -euo pipefail
+          platform="$(docker image inspect "$IMAGE" --format '{{.Os}}/{{.Architecture}}')"
+          test "$platform" = "linux/amd64" || { echo "Unexpected platform: $platform" >&2; exit 1; }
+          # build-template.py rejects an image that is not the colocated layout.
+          docker image inspect "$IMAGE" --format '{{range .Config.Env}}{{println .}}{{end}}' \
+            | grep -qx 'PARSAR_RUNTIME_WORKSPACE=/environment/workspace' \
+            || { echo "Image does not use the colocated Runtime layout." >&2; exit 1; }
+          echo "id=$(docker image inspect "$IMAGE" --format '{{.Id}}')" >> "$GITHUB_OUTPUT"
+
+      - name: Push and record the immutable references
+        if: env.PUSH == 'true'
+        env:
+          IMAGE: ${{ steps.reference.outputs.repository }}:${{ steps.reference.outputs.tag }}
+          LOCAL_ID: ${{ steps.verify.outputs.id }}
+          CODEX_SHA256: ${{ steps.codex.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE"
+          digest="$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}')"
+          {
+            echo "### Qualified Codex Runtime image"
+            echo
+            echo '```'
+            echo "tag:              $IMAGE"
+            echo "registry digest:  $digest"
+            echo "local image id:   $LOCAL_ID"
+            echo "codex tarball:    sha256:$CODEX_SHA256"
+            echo '```'
+            echo
+            echo "Pin \`expected_codex_sha256\` to that tarball digest for later runs."
+            echo
+            echo "#### Next step, on an operator machine that holds the E2B key"
+            echo
+            echo "The template build needs the local image and the account key, so it is"
+            echo "not run in CI:"
+            echo
+            echo '```sh'
+            echo "docker pull $digest"
+            echo "LOCAL=\$(docker image inspect $digest --format '{{.Id}}')"
+            echo "\"\$HOME/.parsar/build/e2b-sdk/bin/python\" services/agents-api/deploy/e2b/build-template.py \\"
+            echo "  --image \"\$LOCAL\" \\"
+            echo "  --name your-runtime-build \\"
+            echo "  --api-key-file \"\$HOME/.parsar/secrets/e2b.key\" \\"
+            echo "  --output \"\$HOME/.parsar/build/e2b-template.json\""
+            echo '```'
+            echo
+            echo "Then put the returned immutable \`templateID:build_UUID\` in the Core"
+            echo "managed-runtimes configuration. Never deploy a mutable template alias."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up the registry session
+        if: always() && env.PUSH == 'true'
+        run: docker logout "$REGISTRY" || true

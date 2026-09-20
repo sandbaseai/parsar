@@ -1,0 +1,335 @@
+# Deploy the standalone Agents API (Core) to Kubernetes by image digest.
+#
+# Fork-local operator tooling. It renders deploy/k8s/agents-api/core.yaml, runs the
+# explicit migration Job, then rolls the single Core replica.
+#
+# What this workflow deliberately does NOT do:
+#   - It never creates or mutates the configuration Secret. Core caller keys, model
+#     provider credentials and the E2B account key are created in the cluster by the
+#     operator and never pass through GitHub.
+#   - It never scales beyond one replica. Execution ownership is single-writer.
+#   - It never claims execution readiness. A successful rollout only means the
+#     process is live.
+#   - Without a public hostname it deploys in unmanaged mode: no Ingress, no
+#     AGENTS_API_MANAGED_RUNTIMES_FILE, so environment:none Sessions work and
+#     openai_hosted (Docker or E2B) is rejected explicitly. Managed mode needs the
+#     https/wss entry because the E2B provider requires an https core_url and the
+#     sandbox daemon dials back in.
+#
+# Required cluster state, created out of band:
+#   secret/<config-secret>    keys.json, managed-runtimes.json,
+#                             execution-options.json, e2b.key
+#   secret/<database-secret>  key `url` with the dedicated execution database URL
+#   secret/<pull-secret>      existing CCR docker-registry Secret in the namespace
+#
+# KUBECONFIG_TEST is read the same way sandbase-monorepo reads it: base64 or raw
+# kubeconfig YAML, with an optional API server override.
+#
+# managed-runtimes.json must use the public endpoint and the mounted key path:
+#   { "core_url": "https://<host>/api/v1",
+#     "default_provider": "<uuid>",
+#     "e2b": { "<uuid>": { "api_key_file": "/etc/agents-api/e2b.key",
+#                          "template": "TEMPLATE_ID:BUILD_UUID",
+#                          "lease_seconds": 7200 } } }
+name: agents-api deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Core image by digest, e.g. registry/ns/agents-api@sha256:..."
+        required: true
+        type: string
+      host:
+        description: "Public Core hostname. Empty deploys without Ingress or managed Runtime admission"
+        required: false
+        default: ""
+        type: string
+      k8s_namespace:
+        description: "Kubernetes namespace"
+        required: false
+        default: sandbase-test
+        type: string
+      pull_secret:
+        description: "Existing docker-registry Secret used to pull the Core image"
+        required: false
+        default: registry-secret
+        type: string
+      k8s_server:
+        description: "Optional API server override, as used by the monorepo deploy"
+        required: false
+        type: string
+      insecure_skip_tls_verify:
+        description: "Skip API server certificate verification (only with an override)"
+        required: false
+        default: false
+        type: boolean
+      engine:
+        description: "AGENTS_API_ENGINE"
+        required: false
+        default: codex
+        type: choice
+        options: [codex, claude_sdk, mcode]
+      config_secret:
+        description: "Secret holding keys.json, managed-runtimes.json, execution-options.json, e2b.key"
+        required: false
+        default: agents-api-config
+        type: string
+      database_secret:
+        description: "Secret holding the execution database URL under key `url`"
+        required: false
+        default: agents-api-database
+        type: string
+      ingress_class:
+        description: "Ingress class"
+        required: false
+        default: nginx
+        type: string
+      cluster_issuer:
+        description: "cert-manager ClusterIssuer for the public TLS certificate"
+        required: false
+        default: letsencrypt-prod
+        type: string
+      dry_run:
+        description: "Render and diff only; apply nothing"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  # One deployment at a time: the rollout replaces a single-writer process.
+  group: agents-api-deploy-${{ inputs.k8s_namespace }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CORE_IMAGE: ${{ inputs.image }}
+      CORE_HOST: ${{ inputs.host }}
+      K8S_NAMESPACE: ${{ inputs.k8s_namespace }}
+      AGENTS_API_ENGINE: ${{ inputs.engine }}
+      CONFIG_SECRET: ${{ inputs.config_secret }}
+      DATABASE_SECRET: ${{ inputs.database_secret }}
+      INGRESS_CLASS: ${{ inputs.ingress_class }}
+      PULL_SECRET: ${{ inputs.pull_secret }}
+      CLUSTER_ISSUER: ${{ inputs.cluster_issuer }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve the deployment mode
+        run: |
+          set -euo pipefail
+          case "$CORE_IMAGE" in
+            *@sha256:*) ;;
+            *) echo "Deploy by digest, not by a mutable tag: $CORE_IMAGE" >&2; exit 1 ;;
+          esac
+          if [ -z "$CORE_HOST" ]; then
+            echo "MANAGED=false" >> "$GITHUB_ENV"
+            # Rendering still needs a value; nothing references it in this mode.
+            echo "CORE_HOST=unset.invalid" >> "$GITHUB_ENV"
+            echo "No hostname supplied: deploying without Ingress and without managed"
+            echo "Runtime admission. environment:none Sessions only."
+          else
+            case "$CORE_HOST" in
+              *[!a-zA-Z0-9.-]*) echo "Invalid host: $CORE_HOST" >&2; exit 1 ;;
+            esac
+            echo "MANAGED=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Configure cluster access
+        env:
+          KUBECONFIG_TEST: ${{ secrets.KUBECONFIG_TEST }}
+        run: |
+          set -euo pipefail
+          test -n "$KUBECONFIG_TEST" || { echo "KUBECONFIG_TEST is not configured." >&2; exit 1; }
+          install -d -m 700 "$RUNNER_TEMP/.kube"
+          # Accept raw YAML or a base64 blob, without printing either form.
+          if printf '%s' "$KUBECONFIG_TEST" | grep -q '^apiVersion:'; then
+            printf '%s' "$KUBECONFIG_TEST" > "$RUNNER_TEMP/.kube/config"
+          else
+            printf '%s' "$KUBECONFIG_TEST" | base64 -d > "$RUNNER_TEMP/.kube/config"
+          fi
+          chmod 600 "$RUNNER_TEMP/.kube/config"
+          grep -q '^apiVersion:' "$RUNNER_TEMP/.kube/config" \
+            || { echo "KUBECONFIG_TEST is neither kubeconfig YAML nor base64 kubeconfig." >&2; exit 1; }
+          echo "KUBECONFIG=$RUNNER_TEMP/.kube/config" >> "$GITHUB_ENV"
+
+      - name: Override the API server address
+        if: inputs.k8s_server != ''
+        env:
+          KUBECONFIG: ${{ runner.temp }}/.kube/config
+          K8S_SERVER: ${{ inputs.k8s_server }}
+          SKIP_TLS: ${{ inputs.insecure_skip_tls_verify }}
+        run: |
+          set -euo pipefail
+          cluster="$(kubectl config get-clusters | tail -1)"
+          # Certificate verification is only skipped when explicitly requested,
+          # because this connection carries cluster-admin authority.
+          kubectl config set-cluster "$cluster" --server="$K8S_SERVER" \
+            --insecure-skip-tls-verify="$SKIP_TLS"
+      - name: Check the cluster and required Secrets
+        run: |
+          set -euo pipefail
+          kubectl version --output=yaml | sed -n '1,12p'
+          kubectl get namespace "$K8S_NAMESPACE" > /dev/null
+          # Fail closed: a Core without its private configuration would start
+          # without managed Runtime admission or reject every caller. Only key
+          # names are read here; no secret value is fetched or printed.
+          kubectl -n "$K8S_NAMESPACE" get secret "$CONFIG_SECRET" \
+            -o go-template='{{range $key, $value := .data}}{{$key}}{{"\n"}}{{end}}' > /tmp/config-keys
+          required="keys.json execution-options.json"
+          # The managed pair is only needed, and only honest, in managed mode.
+          if [ "$MANAGED" = "true" ]; then
+            required="$required managed-runtimes.json e2b.key"
+          fi
+          for entry in $required; do
+            grep -qx "$entry" /tmp/config-keys \
+              || { echo "Secret $CONFIG_SECRET is missing key $entry." >&2; exit 1; }
+          done
+          kubectl -n "$K8S_NAMESPACE" get secret "$DATABASE_SECRET" \
+            -o go-template='{{range $key, $value := .data}}{{$key}}{{"\n"}}{{end}}' \
+            | grep -qx url \
+            || { echo "Secret $DATABASE_SECRET is missing key url." >&2; exit 1; }
+          # A private CCR image needs the existing pull Secret in this namespace.
+          kubectl -n "$K8S_NAMESPACE" get secret "$PULL_SECRET" \
+            -o 'jsonpath={.type}' | grep -qx 'kubernetes.io/dockerconfigjson' \
+            || { echo "Secret $PULL_SECRET is not a docker-registry Secret." >&2; exit 1; }
+
+      - name: Render the manifest
+        run: |
+          set -euo pipefail
+          # Roll the Pod whenever the configuration Secret changes, since Core reads
+          # its managed Runtime configuration once at startup.
+          CONFIG_REVISION="$(kubectl -n "$K8S_NAMESPACE" get secret "$CONFIG_SECRET" \
+            -o 'jsonpath={.metadata.resourceVersion}')"
+          RELEASE="${GITHUB_RUN_ID}"
+          export CONFIG_REVISION RELEASE
+          # Substitute an explicit allowlist instead of every ambient variable, and
+          # fail on an unknown or empty placeholder rather than deploying a blank.
+          python3 - deploy/k8s/agents-api/core.yaml "$RUNNER_TEMP/core.rendered.yaml" <<'PY'
+          import os, re, sys
+          allowed = [
+              'RELEASE', 'K8S_NAMESPACE', 'CORE_IMAGE', 'CORE_HOST', 'CONFIG_SECRET',
+              'DATABASE_SECRET', 'CONFIG_REVISION', 'AGENTS_API_ENGINE',
+              'INGRESS_CLASS', 'CLUSTER_ISSUER', 'PULL_SECRET',
+          ]
+          values = {}
+          for name in allowed:
+              value = os.environ.get(name, '')
+              if not value:
+                  sys.exit('Missing deployment value: ' + name)
+              values[name] = value
+          def replace(match):
+              name = match.group(1)
+              if name not in values:
+                  sys.exit('Unknown placeholder in manifest: ' + name)
+              return values[name]
+
+          def select(text, managed):
+              # Drop #@if MANAGED ... #@endif blocks when managed mode is off.
+              kept, skipping = [], False
+              for line in text.splitlines(True):
+                  marker = line.strip()
+                  if marker == '#@if MANAGED':
+                      skipping = not managed
+                      continue
+                  if marker == '#@endif':
+                      skipping = False
+                      continue
+                  if not skipping:
+                      kept.append(line)
+              return ''.join(kept)
+
+          managed = os.environ.get('MANAGED') == 'true'
+          rendered = select(open(sys.argv[1]).read(), managed)
+          open(sys.argv[2], 'w').write(re.sub(r'\$\{(\w+)\}', replace, rendered))
+          PY
+          grep -c '^kind:' "$RUNNER_TEMP/core.rendered.yaml"
+          echo "RENDERED=$RUNNER_TEMP/core.rendered.yaml" >> "$GITHUB_ENV"
+          if [ "$MANAGED" = "true" ]; then
+            python3 - deploy/k8s/agents-api/ingress.yaml "$RUNNER_TEMP/ingress.rendered.yaml" <<'PY'
+          import os, re, sys
+          names = ['K8S_NAMESPACE', 'CORE_HOST', 'INGRESS_CLASS', 'CLUSTER_ISSUER']
+          values = {}
+          for name in names:
+              value = os.environ.get(name, '')
+              if not value:
+                  sys.exit('Missing deployment value: ' + name)
+              values[name] = value
+          def replace(match):
+              name = match.group(1)
+              if name not in values:
+                  sys.exit('Unknown placeholder in manifest: ' + name)
+              return values[name]
+          open(sys.argv[2], 'w').write(
+              re.sub(r'\$\{(\w+)\}', replace, open(sys.argv[1]).read()))
+          PY
+            echo "RENDERED_INGRESS=$RUNNER_TEMP/ingress.rendered.yaml" >> "$GITHUB_ENV"
+          fi
+
+      - name: Diff against the cluster
+        run: kubectl diff -f "$RENDERED" || true
+
+      - name: Apply
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          kubectl apply -f "$RENDERED"
+          if [ -n "${RENDERED_INGRESS:-}" ]; then kubectl apply -f "$RENDERED_INGRESS"; fi
+
+      - name: Wait for the migration Job
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          job="agents-api-migrate-${GITHUB_RUN_ID}"
+          if ! kubectl -n "$K8S_NAMESPACE" wait --for=condition=complete --timeout=300s "job/$job"; then
+            kubectl -n "$K8S_NAMESPACE" logs "job/$job" --tail=100 || true
+            echo "Migration did not complete; Core was not rolled." >&2
+            exit 1
+          fi
+
+      - name: Roll Core
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          kubectl -n "$K8S_NAMESPACE" rollout status deployment/agents-api --timeout=300s
+          kubectl -n "$K8S_NAMESPACE" get deployment agents-api \
+            -o 'jsonpath={.spec.replicas}{"\n"}' | grep -qx 1 \
+            || { echo "Core must run exactly one replica." >&2; exit 1; }
+
+      - name: Report
+        if: ${{ !inputs.dry_run }}
+        run: |
+          {
+            echo "### Core deployed"
+            echo
+            echo '```'
+            echo "image:     $CORE_IMAGE"
+            echo "namespace: $K8S_NAMESPACE"
+            if [ "$MANAGED" = "true" ]; then
+              echo "public:    https://$CORE_HOST/v1  (callers)"
+              echo "daemon:    wss://$CORE_HOST/api/v1/agent-daemon/ws  (sandbox dials in)"
+              echo "managed:   enabled"
+            else
+              echo "in-cluster: http://agents-api.$K8S_NAMESPACE.svc:8091/v1"
+              echo "managed:    disabled (no hostname; openai_hosted is rejected)"
+            fi
+            echo '```'
+            echo
+            echo "A completed rollout proves liveness only. Managed Runtime provisioning,"
+            echo "native readiness and model execution stay unproven until a real Turn runs."
+            if [ "$MANAGED" = "true" ]; then
+              echo "Verify the Ingress actually upgrades WebSockets on the daemon path before"
+              echo "expecting an E2B sandbox to register."
+            else
+              echo "Re-run with a hostname once DNS and the certificate exist to enable"
+              echo "managed Runtime admission."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
