@@ -79,6 +79,36 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Resolve the pinned base images
+        run: |
+          set -euo pipefail
+          # Checked before the expensive Rust and Go builds: the qualified profile
+          # pins base images by digest, and a digest that no longer resolves on the
+          # registry fails the docker build minutes later for a reason unrelated to
+          # this repository. Report both pins, including the E2B template base, and
+          # the digest the floating tag currently points at.
+          codex_base="$(sed -n 's/^FROM \(.*\)$/\1/p' services/agents-api/deploy/codex/Dockerfile | head -1)"
+          e2b_base="$(sed -n "s/^BASE = '\(.*\)'$/\1/p" services/agents-api/deploy/e2b/build-template.py | head -1)"
+          status=0
+          for reference in "$codex_base" "$e2b_base"; do
+            if docker buildx imagetools inspect --format '{{.Name}}' "$reference" > /dev/null 2>&1; then
+              echo "resolved: $reference"
+            else
+              echo "MISSING:  $reference"
+              status=1
+            fi
+          done
+          echo "current debian:bookworm-slim:"
+          docker buildx imagetools inspect debian:bookworm-slim \
+            --format '{{.Manifest.Digest}}' 2>&1 | tail -1
+          echo "current node:22.23.1-bookworm-slim:"
+          docker buildx imagetools inspect node:22.23.1-bookworm-slim \
+            --format '{{.Manifest.Digest}}' 2>&1 | tail -1
+          if [ "$status" -ne 0 ]; then
+            echo "::error::A pinned base image digest no longer resolves. Re-pinning changes the qualified image, so decide that explicitly rather than floating the tag." >&2
+            exit 1
+          fi
+
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
