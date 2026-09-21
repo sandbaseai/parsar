@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: "Runner label. Defaults to vars.AGENTS_CI_RUNNER, then self-hosted"
+        description: "Runner label. Defaults to vars.AGENTS_CI_RUNNER, then ubuntu-latest"
         required: false
         default: ""
         type: string
@@ -61,12 +61,11 @@ concurrency:
 
 jobs:
   image:
-    # Defaults to the monorepo's self-hosted runner, which owns the registry route,
-    # the cluster proxy in the kubeconfig and the Docker daemon. That runner's HOME
-    # is /nonexistent, so every tool that would write to it gets an explicit
-    # workspace path below. A GitHub-hosted label also works when the cluster and
-    # registry are reachable from it.
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || inputs.runner || vars.AGENTS_CI_RUNNER || 'self-hosted' }}
+    # Hosted runner, matching new-api: the registry and the cluster API are both
+    # reachable from it. Override with the runner input or vars.AGENTS_CI_RUNNER to
+    # use the self-hosted runner instead; its HOME is /nonexistent, which is why
+    # every tool that would write there gets an explicit workspace path below.
+    runs-on: ${{ inputs.runner || vars.AGENTS_CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
     env:
       HOME: ${{ github.workspace }}/.home

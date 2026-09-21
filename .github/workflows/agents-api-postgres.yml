@@ -16,16 +16,16 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: "Runner label. Defaults to vars.AGENTS_CI_RUNNER, then self-hosted"
+        description: "Runner label. Defaults to vars.AGENTS_CI_RUNNER, then ubuntu-latest"
         required: false
         default: ""
         type: string
       kubeconfig_proxy:
-        description: "Keep the kubeconfig proxy-url (self-hosted) or drop it (hosted runner)"
+        description: "Drop the kubeconfig proxy-url (hosted runner) or keep it (self-hosted)"
         required: false
-        default: keep
+        default: drop
         type: choice
-        options: [keep, drop]
+        options: [drop, keep]
       k8s_namespace:
         description: "Kubernetes namespace"
         required: false
@@ -55,11 +55,6 @@ on:
         description: "Optional API server override, as used by the monorepo deploy"
         required: false
         type: string
-      insecure_skip_tls_verify:
-        description: "Skip API server certificate verification (only with an override)"
-        required: false
-        default: false
-        type: boolean
       dry_run:
         description: "Render and diff only; apply nothing"
         required: false
@@ -75,12 +70,11 @@ concurrency:
 
 jobs:
   postgres:
-    # Defaults to the monorepo's self-hosted runner, which owns the registry route,
-    # the cluster proxy in the kubeconfig and the Docker daemon. That runner's HOME
-    # is /nonexistent, so every tool that would write to it gets an explicit
-    # workspace path below. A GitHub-hosted label also works when the cluster and
-    # registry are reachable from it.
-    runs-on: ${{ inputs.runner || vars.AGENTS_CI_RUNNER || 'self-hosted' }}
+    # Hosted runner, matching new-api: the registry and the cluster API are both
+    # reachable from it. Override with the runner input or vars.AGENTS_CI_RUNNER to
+    # use the self-hosted runner instead; its HOME is /nonexistent, which is why
+    # every tool that would write there gets an explicit workspace path below.
+    runs-on: ${{ inputs.runner || vars.AGENTS_CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     env:
       HOME: ${{ github.workspace }}/.home
@@ -111,47 +105,48 @@ jobs:
       - name: Configure cluster access
         env:
           KUBECONFIG_TEST: ${{ secrets.KUBECONFIG_TEST }}
+          K8S_SERVER: ${{ inputs.k8s_server }}
         run: |
           set -euo pipefail
-          test -n "$KUBECONFIG_TEST" || { echo "KUBECONFIG_TEST is not configured." >&2; exit 1; }
+          if [ -z "$KUBECONFIG_TEST" ]; then
+            echo "::error::KUBECONFIG_TEST is not configured."
+            exit 1
+          fi
+          kubectl version --client
           install -d -m 700 "$RUNNER_TEMP/.kube"
+          config_path="$RUNNER_TEMP/.kube/config"
           # Accept raw YAML or a base64 blob, without printing either form.
           if printf '%s' "$KUBECONFIG_TEST" | grep -q '^apiVersion:'; then
-            printf '%s' "$KUBECONFIG_TEST" > "$RUNNER_TEMP/.kube/config"
+            printf '%s' "$KUBECONFIG_TEST" > "$config_path"
           else
-            printf '%s' "$KUBECONFIG_TEST" | base64 -d > "$RUNNER_TEMP/.kube/config"
+            printf '%s' "$KUBECONFIG_TEST" | base64 -d > "$config_path"
           fi
-          chmod 600 "$RUNNER_TEMP/.kube/config"
-          grep -q '^apiVersion:' "$RUNNER_TEMP/.kube/config" \
-            || { echo "KUBECONFIG_TEST is neither kubeconfig YAML nor base64 kubeconfig." >&2; exit 1; }
-          # The kubeconfig may carry proxy-url for the self-hosted runner's HTTP proxy.
-          # Keep it by default, as the monorepo deploy does; a hosted runner cannot
-          # reach that address and must drop it explicitly.
-          if [ "$KUBECONFIG_PROXY" = "drop" ] && grep -q 'proxy-url:' "$RUNNER_TEMP/.kube/config"; then
+          chmod 600 "$config_path"
+          grep -q '^apiVersion:' "$config_path" \
+            || { echo "::error::KUBECONFIG_TEST is neither kubeconfig YAML nor base64 kubeconfig."; exit 1; }
+          export KUBECONFIG="$config_path"
+          # The kubeconfig may carry proxy-url for a workstation or self-hosted HTTP
+          # proxy. A hosted runner cannot reach that address, so drop it by default
+          # and keep it only when running on the runner that owns the proxy.
+          if [ "$KUBECONFIG_PROXY" = "drop" ] && grep -q 'proxy-url:' "$config_path"; then
             echo "Dropping kubeconfig proxy-url; connecting to the API server directly."
-            grep -v 'proxy-url:' "$RUNNER_TEMP/.kube/config" > "$RUNNER_TEMP/.kube/config.direct"
-            mv "$RUNNER_TEMP/.kube/config.direct" "$RUNNER_TEMP/.kube/config"
-            chmod 600 "$RUNNER_TEMP/.kube/config"
+            grep -v 'proxy-url:' "$config_path" > "$config_path.direct"
+            mv "$config_path.direct" "$config_path"
+            chmod 600 "$config_path"
           fi
-          echo "KUBECONFIG=$RUNNER_TEMP/.kube/config" >> "$GITHUB_ENV"
+          if [ -n "$K8S_SERVER" ]; then
+            cluster="$(kubectl config view --minify -o jsonpath='{.clusters[0].name}')"
+            kubectl config set-cluster "$cluster" --server="$K8S_SERVER"
+          fi
+          # Certificate verification stays on; prove the connection before anything
+          # downstream tolerates a failure.
+          kubectl cluster-info
+          echo "KUBECONFIG=$config_path" >> "$GITHUB_ENV"
 
-      - name: Override the API server address
-        if: inputs.k8s_server != ''
-        env:
-          KUBECONFIG: ${{ runner.temp }}/.kube/config
-          K8S_SERVER: ${{ inputs.k8s_server }}
-          SKIP_TLS: ${{ inputs.insecure_skip_tls_verify }}
-        run: |
-          set -euo pipefail
-          cluster="$(kubectl config get-clusters | tail -1)"
-          kubectl config set-cluster "$cluster" --server="$K8S_SERVER" \
-            --insecure-skip-tls-verify="$SKIP_TLS"
-
-      - name: Check cluster access
+      - name: Check the namespace
         run: |
           set -euo pipefail
           # Runs in dry-run too: a tolerated diff failure must not look like success.
-          kubectl version --output=yaml | sed -n '1,12p'
           kubectl get namespace "$K8S_NAMESPACE" > /dev/null
 
       - name: Ensure the password Secret
