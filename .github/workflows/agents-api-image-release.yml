@@ -68,7 +68,6 @@ jobs:
     runs-on: ${{ inputs.runner || vars.AGENTS_CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
     env:
-      HOME: ${{ github.workspace }}/.home
       PARSAR_HOME: ${{ github.workspace }}/.parsar
       REGISTRY: ${{ inputs.registry || 'useccr.ccs.tencentyun.com' }}
       NAMESPACE: ${{ inputs.namespace || 'sandbase' }}
@@ -80,9 +79,15 @@ jobs:
           set -euo pipefail
           test "$(uname -s)/$(uname -m)" = "Linux/x86_64" \
             || { echo "This build requires a Linux x86_64 runner." >&2; exit 1; }
-          # HOME is /nonexistent on this runner; create the workspace-scoped one that
-          # docker, go, cargo and npm will write into.
-          mkdir -p "$HOME"
+          # HOME is /nonexistent on the self-hosted runner, but on a hosted runner it
+          # holds the preinstalled toolchains. Only redirect it when it is unusable.
+          if [ ! -d "$HOME" ] || [ ! -w "$HOME" ]; then
+            HOME="$GITHUB_WORKSPACE/.home"
+            mkdir -p "$HOME"
+            export HOME
+            echo "HOME=$HOME" >> "$GITHUB_ENV"
+            echo "Redirected HOME to $HOME"
+          fi
           echo "HOME=$HOME"
           missing=""
           for tool in docker python3; do
