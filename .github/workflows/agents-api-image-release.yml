@@ -56,21 +56,38 @@ concurrency:
 
 jobs:
   image:
-    # The image is linux/amd64 only; build it on a native amd64 runner.
-    runs-on: ubuntu-latest
+    # The monorepo builds and deploys from this runner: it owns the registry route,
+    # the cluster proxy in the kubeconfig, and the Docker daemon used here.
+    # Its HOME is /nonexistent, so every tool that would write to it gets an
+    # explicit workspace path below.
+    runs-on: self-hosted
     timeout-minutes: 30
     env:
+      HOME: ${{ github.workspace }}/.home
       PARSAR_HOME: ${{ github.workspace }}/.parsar
       REGISTRY: ${{ inputs.registry || 'useccr.ccs.tencentyun.com' }}
       NAMESPACE: ${{ inputs.namespace || 'sandbase' }}
       # A pull request never publishes.
       PUSH: ${{ github.event_name == 'workflow_dispatch' && inputs.push && 'true' || 'false' }}
     steps:
-      - name: Require an amd64 runner
+      - name: Prepare the runner environment
         run: |
           set -euo pipefail
           test "$(uname -s)/$(uname -m)" = "Linux/x86_64" \
             || { echo "This build requires a Linux x86_64 runner." >&2; exit 1; }
+          # HOME is /nonexistent on this runner; create the workspace-scoped one that
+          # docker, go, cargo and npm will write into.
+          mkdir -p "$HOME"
+          echo "HOME=$HOME"
+          missing=""
+          for tool in docker python3; do
+            command -v "$tool" > /dev/null 2>&1 || missing="$missing $tool"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required tools on the runner:$missing" >&2
+            exit 1
+          fi
+          docker version --format 'docker {{.Server.Version}} {{.Server.Os}}/{{.Server.Arch}}'
 
       - uses: actions/checkout@v7
         with:

@@ -106,9 +106,14 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    # The monorepo builds and deploys from this runner: it owns the registry route,
+    # the cluster proxy in the kubeconfig, and the Docker daemon used here.
+    # Its HOME is /nonexistent, so every tool that would write to it gets an
+    # explicit workspace path below.
+    runs-on: self-hosted
     timeout-minutes: 20
     env:
+      HOME: ${{ github.workspace }}/.home
       CORE_IMAGE: ${{ inputs.image }}
       CORE_HOST: ${{ inputs.host }}
       K8S_NAMESPACE: ${{ inputs.k8s_namespace }}
@@ -122,6 +127,19 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+
+      - name: Prepare the runner environment
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME"
+          missing=""
+          for tool in kubectl python3; do
+            command -v "$tool" > /dev/null 2>&1 || missing="$missing $tool"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required tools on the runner:$missing" >&2
+            exit 1
+          fi
 
       - name: Resolve the deployment mode
         run: |
@@ -159,15 +177,8 @@ jobs:
           chmod 600 "$RUNNER_TEMP/.kube/config"
           grep -q '^apiVersion:' "$RUNNER_TEMP/.kube/config" \
             || { echo "KUBECONFIG_TEST is neither kubeconfig YAML nor base64 kubeconfig." >&2; exit 1; }
-          # A workstation kubeconfig can carry proxy-url pointing at a local HTTP
-          # proxy. That address does not exist on a runner, so drop it and reach the
-          # API server directly instead of failing on a refused localhost connect.
-          if grep -q 'proxy-url:' "$RUNNER_TEMP/.kube/config"; then
-            echo "Removing kubeconfig proxy-url; connecting to the API server directly."
-            grep -v 'proxy-url:' "$RUNNER_TEMP/.kube/config" > "$RUNNER_TEMP/.kube/config.direct"
-            mv "$RUNNER_TEMP/.kube/config.direct" "$RUNNER_TEMP/.kube/config"
-            chmod 600 "$RUNNER_TEMP/.kube/config"
-          fi
+          # The kubeconfig may carry proxy-url for this runner's HTTP proxy. Keep it:
+          # the cluster is reached through that proxy, as the monorepo deploy does.
           echo "KUBECONFIG=$RUNNER_TEMP/.kube/config" >> "$GITHUB_ENV"
 
       - name: Override the API server address
