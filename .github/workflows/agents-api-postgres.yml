@@ -1,0 +1,227 @@
+# Provision the in-cluster PostgreSQL execution database for the Agents API.
+#
+# Fork-local operator tooling for a test deployment. It is idempotent:
+#   - creates the password Secret only when it is absent, and never rotates it
+#   - applies the StatefulSet and its ClusterIP Service
+#   - writes secret/<database-secret> with the in-cluster URL only when absent, so
+#     an existing external database is never silently replaced
+#
+# Scope limits, stated because they matter for a database: one instance, no
+# replication, no failover, no backups, reachable only inside the cluster. Losing
+# this volume loses every durable Session, Turn and Item, which nothing upstream
+# can reconstruct. Use a managed database for anything that must survive.
+name: agents-api postgres
+
+on:
+  workflow_dispatch:
+    inputs:
+      k8s_namespace:
+        description: "Kubernetes namespace"
+        required: false
+        default: sandbase-test
+        type: string
+      postgres_secret:
+        description: "Secret holding the database password under key `password`"
+        required: false
+        default: agents-api-postgres
+        type: string
+      database_secret:
+        description: "Secret written with the connection URL under key `url`"
+        required: false
+        default: agents-api-database
+        type: string
+      storage_class:
+        description: "StorageClass for the data volume. Empty uses the cluster default"
+        required: false
+        default: ""
+        type: string
+      storage_size:
+        description: "Data volume size"
+        required: false
+        default: 20Gi
+        type: string
+      k8s_server:
+        description: "Optional API server override, as used by the monorepo deploy"
+        required: false
+        type: string
+      insecure_skip_tls_verify:
+        description: "Skip API server certificate verification (only with an override)"
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: "Render and diff only; apply nothing"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agents-api-postgres-${{ inputs.k8s_namespace }}
+  cancel-in-progress: false
+
+jobs:
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      K8S_NAMESPACE: ${{ inputs.k8s_namespace }}
+      POSTGRES_SECRET: ${{ inputs.postgres_secret }}
+      DATABASE_SECRET: ${{ inputs.database_secret }}
+      STORAGE_CLASS: ${{ inputs.storage_class }}
+      STORAGE_SIZE: ${{ inputs.storage_size }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Configure cluster access
+        env:
+          KUBECONFIG_TEST: ${{ secrets.KUBECONFIG_TEST }}
+        run: |
+          set -euo pipefail
+          test -n "$KUBECONFIG_TEST" || { echo "KUBECONFIG_TEST is not configured." >&2; exit 1; }
+          install -d -m 700 "$RUNNER_TEMP/.kube"
+          # Accept raw YAML or a base64 blob, without printing either form.
+          if printf '%s' "$KUBECONFIG_TEST" | grep -q '^apiVersion:'; then
+            printf '%s' "$KUBECONFIG_TEST" > "$RUNNER_TEMP/.kube/config"
+          else
+            printf '%s' "$KUBECONFIG_TEST" | base64 -d > "$RUNNER_TEMP/.kube/config"
+          fi
+          chmod 600 "$RUNNER_TEMP/.kube/config"
+          grep -q '^apiVersion:' "$RUNNER_TEMP/.kube/config" \
+            || { echo "KUBECONFIG_TEST is neither kubeconfig YAML nor base64 kubeconfig." >&2; exit 1; }
+          echo "KUBECONFIG=$RUNNER_TEMP/.kube/config" >> "$GITHUB_ENV"
+
+      - name: Override the API server address
+        if: inputs.k8s_server != ''
+        env:
+          KUBECONFIG: ${{ runner.temp }}/.kube/config
+          K8S_SERVER: ${{ inputs.k8s_server }}
+          SKIP_TLS: ${{ inputs.insecure_skip_tls_verify }}
+        run: |
+          set -euo pipefail
+          cluster="$(kubectl config get-clusters | tail -1)"
+          kubectl config set-cluster "$cluster" --server="$K8S_SERVER" \
+            --insecure-skip-tls-verify="$SKIP_TLS"
+
+      - name: Ensure the namespace and the password Secret
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          kubectl get namespace "$K8S_NAMESPACE" > /dev/null
+          if kubectl -n "$K8S_NAMESPACE" get secret "$POSTGRES_SECRET" > /dev/null 2>&1; then
+            echo "Password Secret already exists; keeping it. Rotating it here would"
+            echo "break the running database and every stored connection URL."
+          else
+            # Generated once, never printed, never echoed into logs or step outputs.
+            openssl rand -base64 30 | tr -d '\n=/+' | head -c 32 > "$RUNNER_TEMP/pgpass"
+            kubectl -n "$K8S_NAMESPACE" create secret generic "$POSTGRES_SECRET" \
+              --from-file=password="$RUNNER_TEMP/pgpass"
+            echo "Created $POSTGRES_SECRET."
+          fi
+
+      - name: Render the manifest
+        run: |
+          set -euo pipefail
+          python3 - deploy/k8s/agents-api/postgres.yaml "$RUNNER_TEMP/postgres.rendered.yaml" <<'PY'
+          import os, re, sys
+          required = ['K8S_NAMESPACE', 'POSTGRES_SECRET', 'STORAGE_SIZE']
+          values = {name: os.environ.get(name, '') for name in required}
+          for name, value in values.items():
+              if not value:
+                  sys.exit('Missing deployment value: ' + name)
+          storage_class = os.environ.get('STORAGE_CLASS', '').strip()
+          values['STORAGE_CLASS'] = storage_class
+
+          def select(text, enabled):
+              # Drop the storageClassName line when no class is requested, so the
+              # cluster default applies instead of an empty string.
+              kept, skipping = [], False
+              for line in text.splitlines(True):
+                  marker = line.strip()
+                  if marker == '#@if STORAGE_CLASS':
+                      skipping = not enabled
+                      continue
+                  if marker == '#@endif':
+                      skipping = False
+                      continue
+                  if not skipping:
+                      kept.append(line)
+              return ''.join(kept)
+
+          def replace(match):
+              name = match.group(1)
+              if name not in values or not values[name]:
+                  sys.exit('Unknown or empty placeholder: ' + name)
+              return values[name]
+
+          rendered = select(open(sys.argv[1]).read(), bool(storage_class))
+          open(sys.argv[2], 'w').write(re.sub(r'\$\{(\w+)\}', replace, rendered))
+          PY
+          grep -c '^kind:' "$RUNNER_TEMP/postgres.rendered.yaml"
+          echo "RENDERED=$RUNNER_TEMP/postgres.rendered.yaml" >> "$GITHUB_ENV"
+
+      - name: Diff against the cluster
+        run: kubectl diff -f "$RENDERED" || true
+
+      - name: Apply and wait
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # A StatefulSet volume claim template is immutable. Applying a changed size
+          # or class fails here instead of silently leaving the old volume.
+          kubectl apply -f "$RENDERED"
+          kubectl -n "$K8S_NAMESPACE" rollout status statefulset/agents-api-postgres --timeout=300s
+
+      - name: Verify the database accepts its own credentials
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          kubectl -n "$K8S_NAMESPACE" exec statefulset/agents-api-postgres -- \
+            psql --username agents_api --dbname agents_api -At \
+              -c "select current_database(), current_user, split_part(version(), ' ', 2)"
+
+      - name: Publish the connection URL Secret
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if kubectl -n "$K8S_NAMESPACE" get secret "$DATABASE_SECRET" > /dev/null 2>&1; then
+            echo "$DATABASE_SECRET already exists; leaving it untouched so an external"
+            echo "database is never replaced. Delete it first to switch to this instance."
+            exit 0
+          fi
+          password="$(kubectl -n "$K8S_NAMESPACE" get secret "$POSTGRES_SECRET" \
+            -o 'jsonpath={.data.password}' | base64 -d)"
+          echo "::add-mask::$password"
+          host="agents-api-postgres.$K8S_NAMESPACE.svc.cluster.local"
+          # The in-cluster instance terminates no TLS, so the mode is explicit rather
+          # than left to a driver default.
+          printf 'postgres://agents_api:%s@%s:5432/agents_api?sslmode=disable' \
+            "$password" "$host" > "$RUNNER_TEMP/dburl"
+          kubectl -n "$K8S_NAMESPACE" create secret generic "$DATABASE_SECRET" \
+            --from-file=url="$RUNNER_TEMP/dburl"
+          rm -f "$RUNNER_TEMP/dburl"
+          echo "Created $DATABASE_SECRET."
+
+      - name: Report
+        if: ${{ !inputs.dry_run }}
+        run: |
+          {
+            echo "### Agents API execution database"
+            echo
+            echo '```'
+            echo "service:   agents-api-postgres.$K8S_NAMESPACE.svc.cluster.local:5432"
+            echo "database:  agents_api (user agents_api)"
+            echo "url:       secret/$DATABASE_SECRET key url"
+            echo "password:  secret/$POSTGRES_SECRET key password"
+            echo '```'
+            echo
+            echo "Cluster-internal only. One instance, no replication, no backups:"
+            echo "losing this volume loses every durable Session, Turn and Item."
+            echo
+            echo "Core still applies its own migrations. Run the deploy workflow next; its"
+            echo "migration Job executes agents-api-migrate against this database."
+          } >> "$GITHUB_STEP_SUMMARY"
