@@ -19,6 +19,11 @@ name: agents-api image
 on:
   workflow_dispatch:
     inputs:
+      runner:
+        description: "Runner label. Defaults to vars.AGENTS_CI_RUNNER, then self-hosted"
+        required: false
+        default: ""
+        type: string
       registry:
         description: "Registry host"
         required: false
@@ -56,11 +61,12 @@ concurrency:
 
 jobs:
   image:
-    # The monorepo builds and deploys from this runner: it owns the registry route,
-    # the cluster proxy in the kubeconfig, and the Docker daemon used here.
-    # Its HOME is /nonexistent, so every tool that would write to it gets an
-    # explicit workspace path below.
-    runs-on: self-hosted
+    # Defaults to the monorepo's self-hosted runner, which owns the registry route,
+    # the cluster proxy in the kubeconfig and the Docker daemon. That runner's HOME
+    # is /nonexistent, so every tool that would write to it gets an explicit
+    # workspace path below. A GitHub-hosted label also works when the cluster and
+    # registry are reachable from it.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || inputs.runner || vars.AGENTS_CI_RUNNER || 'self-hosted' }}
     timeout-minutes: 30
     env:
       HOME: ${{ github.workspace }}/.home

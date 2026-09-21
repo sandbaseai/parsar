@@ -36,6 +36,17 @@ name: agents-api deploy
 on:
   workflow_dispatch:
     inputs:
+      runner:
+        description: "Runner label. Defaults to vars.AGENTS_CI_RUNNER, then self-hosted"
+        required: false
+        default: ""
+        type: string
+      kubeconfig_proxy:
+        description: "Keep the kubeconfig proxy-url (self-hosted) or drop it (hosted runner)"
+        required: false
+        default: keep
+        type: choice
+        options: [keep, drop]
       image:
         description: "Core image by digest, e.g. registry/ns/agents-api@sha256:..."
         required: true
@@ -106,14 +117,16 @@ concurrency:
 
 jobs:
   deploy:
-    # The monorepo builds and deploys from this runner: it owns the registry route,
-    # the cluster proxy in the kubeconfig, and the Docker daemon used here.
-    # Its HOME is /nonexistent, so every tool that would write to it gets an
-    # explicit workspace path below.
-    runs-on: self-hosted
+    # Defaults to the monorepo's self-hosted runner, which owns the registry route,
+    # the cluster proxy in the kubeconfig and the Docker daemon. That runner's HOME
+    # is /nonexistent, so every tool that would write to it gets an explicit
+    # workspace path below. A GitHub-hosted label also works when the cluster and
+    # registry are reachable from it.
+    runs-on: ${{ inputs.runner || vars.AGENTS_CI_RUNNER || 'self-hosted' }}
     timeout-minutes: 20
     env:
       HOME: ${{ github.workspace }}/.home
+      KUBECONFIG_PROXY: ${{ inputs.kubeconfig_proxy }}
       CORE_IMAGE: ${{ inputs.image }}
       CORE_HOST: ${{ inputs.host }}
       K8S_NAMESPACE: ${{ inputs.k8s_namespace }}
@@ -177,8 +190,15 @@ jobs:
           chmod 600 "$RUNNER_TEMP/.kube/config"
           grep -q '^apiVersion:' "$RUNNER_TEMP/.kube/config" \
             || { echo "KUBECONFIG_TEST is neither kubeconfig YAML nor base64 kubeconfig." >&2; exit 1; }
-          # The kubeconfig may carry proxy-url for this runner's HTTP proxy. Keep it:
-          # the cluster is reached through that proxy, as the monorepo deploy does.
+          # The kubeconfig may carry proxy-url for the self-hosted runner's HTTP proxy.
+          # Keep it by default, as the monorepo deploy does; a hosted runner cannot
+          # reach that address and must drop it explicitly.
+          if [ "$KUBECONFIG_PROXY" = "drop" ] && grep -q 'proxy-url:' "$RUNNER_TEMP/.kube/config"; then
+            echo "Dropping kubeconfig proxy-url; connecting to the API server directly."
+            grep -v 'proxy-url:' "$RUNNER_TEMP/.kube/config" > "$RUNNER_TEMP/.kube/config.direct"
+            mv "$RUNNER_TEMP/.kube/config.direct" "$RUNNER_TEMP/.kube/config"
+            chmod 600 "$RUNNER_TEMP/.kube/config"
+          fi
           echo "KUBECONFIG=$RUNNER_TEMP/.kube/config" >> "$GITHUB_ENV"
 
       - name: Override the API server address
