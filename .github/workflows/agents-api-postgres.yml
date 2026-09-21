@@ -93,6 +93,15 @@ jobs:
           chmod 600 "$RUNNER_TEMP/.kube/config"
           grep -q '^apiVersion:' "$RUNNER_TEMP/.kube/config" \
             || { echo "KUBECONFIG_TEST is neither kubeconfig YAML nor base64 kubeconfig." >&2; exit 1; }
+          # A workstation kubeconfig can carry proxy-url pointing at a local HTTP
+          # proxy. That address does not exist on a runner, so drop it and reach the
+          # API server directly instead of failing on a refused localhost connect.
+          if grep -q 'proxy-url:' "$RUNNER_TEMP/.kube/config"; then
+            echo "Removing kubeconfig proxy-url; connecting to the API server directly."
+            grep -v 'proxy-url:' "$RUNNER_TEMP/.kube/config" > "$RUNNER_TEMP/.kube/config.direct"
+            mv "$RUNNER_TEMP/.kube/config.direct" "$RUNNER_TEMP/.kube/config"
+            chmod 600 "$RUNNER_TEMP/.kube/config"
+          fi
           echo "KUBECONFIG=$RUNNER_TEMP/.kube/config" >> "$GITHUB_ENV"
 
       - name: Override the API server address
@@ -107,11 +116,17 @@ jobs:
           kubectl config set-cluster "$cluster" --server="$K8S_SERVER" \
             --insecure-skip-tls-verify="$SKIP_TLS"
 
-      - name: Ensure the namespace and the password Secret
+      - name: Check cluster access
+        run: |
+          set -euo pipefail
+          # Runs in dry-run too: a tolerated diff failure must not look like success.
+          kubectl version --output=yaml | sed -n '1,12p'
+          kubectl get namespace "$K8S_NAMESPACE" > /dev/null
+
+      - name: Ensure the password Secret
         if: ${{ !inputs.dry_run }}
         run: |
           set -euo pipefail
-          kubectl get namespace "$K8S_NAMESPACE" > /dev/null
           if kubectl -n "$K8S_NAMESPACE" get secret "$POSTGRES_SECRET" > /dev/null 2>&1; then
             echo "Password Secret already exists; keeping it. Rotating it here would"
             echo "break the running database and every stored connection URL."

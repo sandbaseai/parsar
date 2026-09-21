@@ -159,6 +159,15 @@ jobs:
           chmod 600 "$RUNNER_TEMP/.kube/config"
           grep -q '^apiVersion:' "$RUNNER_TEMP/.kube/config" \
             || { echo "KUBECONFIG_TEST is neither kubeconfig YAML nor base64 kubeconfig." >&2; exit 1; }
+          # A workstation kubeconfig can carry proxy-url pointing at a local HTTP
+          # proxy. That address does not exist on a runner, so drop it and reach the
+          # API server directly instead of failing on a refused localhost connect.
+          if grep -q 'proxy-url:' "$RUNNER_TEMP/.kube/config"; then
+            echo "Removing kubeconfig proxy-url; connecting to the API server directly."
+            grep -v 'proxy-url:' "$RUNNER_TEMP/.kube/config" > "$RUNNER_TEMP/.kube/config.direct"
+            mv "$RUNNER_TEMP/.kube/config.direct" "$RUNNER_TEMP/.kube/config"
+            chmod 600 "$RUNNER_TEMP/.kube/config"
+          fi
           echo "KUBECONFIG=$RUNNER_TEMP/.kube/config" >> "$GITHUB_ENV"
 
       - name: Override the API server address
