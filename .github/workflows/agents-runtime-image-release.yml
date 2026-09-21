@@ -72,11 +72,7 @@ jobs:
     runs-on: ${{ inputs.runner || vars.AGENTS_CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 60
     env:
-      HOME: ${{ github.workspace }}/.home
       PARSAR_HOME: ${{ github.workspace }}/.parsar
-      # scripts/build-agents-executor.sh already points CARGO_HOME at PARSAR_HOME;
-      # rustup needs its own explicit directory for the pinned 1.95.0 toolchain.
-      RUSTUP_HOME: ${{ github.workspace }}/.parsar/cache/rustup
       REGISTRY: ${{ inputs.registry || 'useccr.ccs.tencentyun.com' }}
       NAMESPACE: ${{ inputs.namespace || 'sandbase' }}
       PUSH: ${{ inputs.push && 'true' || 'false' }}
@@ -86,9 +82,15 @@ jobs:
           set -euo pipefail
           test "$(uname -s)/$(uname -m)" = "Linux/x86_64" \
             || { echo "This build requires a Linux x86_64 runner." >&2; exit 1; }
-          # HOME is /nonexistent on this runner; create the workspace-scoped one that
-          # docker, go, cargo and npm will write into.
-          mkdir -p "$HOME"
+          # HOME is /nonexistent on the self-hosted runner, but on a hosted runner it
+          # holds the preinstalled toolchains. Only redirect it when it is unusable.
+          if [ ! -d "$HOME" ] || [ ! -w "$HOME" ]; then
+            HOME="$GITHUB_WORKSPACE/.home"
+            mkdir -p "$HOME"
+            export HOME
+            echo "HOME=$HOME" >> "$GITHUB_ENV"
+            echo "Redirected HOME to $HOME"
+          fi
           echo "HOME=$HOME"
           missing=""
           for tool in docker python3 npm; do
@@ -107,19 +109,25 @@ jobs:
       - name: Ensure the pinned Rust toolchain
         run: |
           set -euo pipefail
-          mkdir -p "$RUSTUP_HOME"
-          if command -v cargo > /dev/null 2>&1 && command -v rustup > /dev/null 2>&1; then
-            rustup --version
+          # A rustup shim on PATH is not a usable toolchain, so run cargo instead of
+          # just locating it. packages/codex-executor/rust-toolchain.toml pins the
+          # channel, which rustup fetches on first use inside that directory.
+          if cargo --version > /dev/null 2>&1; then
             cargo --version
             exit 0
           fi
-          echo "rustup is not installed for this runner user; installing it into the workspace."
+          if command -v rustup > /dev/null 2>&1; then
+            echo "rustup has no usable default toolchain; letting the pinned file select one."
+            rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"$/\1/p' packages/codex-executor/rust-toolchain.toml)"
+            cargo --version
+            exit 0
+          fi
+          echo "rustup is not installed for this runner user; installing it into HOME."
           curl --proto '=https' --tlsv1.2 -sSfL https://sh.rustup.rs -o "$RUNNER_TEMP/rustup-init.sh"
-          # rust-toolchain.toml in packages/codex-executor pins the channel, so the
-          # installer only needs to provide rustup itself.
-          sh "$RUNNER_TEMP/rustup-init.sh" -y --no-modify-path --default-toolchain none
+          sh "$RUNNER_TEMP/rustup-init.sh" -y --no-modify-path \
+            --default-toolchain "$(sed -n 's/^channel = "\(.*\)"$/\1/p' packages/codex-executor/rust-toolchain.toml)"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          "$HOME/.cargo/bin/rustup" --version
+          "$HOME/.cargo/bin/cargo" --version
 
       - name: Resolve the pinned base images
         run: |

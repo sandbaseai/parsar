@@ -119,7 +119,6 @@ jobs:
     runs-on: ${{ inputs.runner || vars.AGENTS_CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     env:
-      HOME: ${{ github.workspace }}/.home
       KUBECONFIG_PROXY: ${{ inputs.kubeconfig_proxy }}
       CORE_IMAGE: ${{ inputs.image }}
       CORE_HOST: ${{ inputs.host }}
@@ -138,7 +137,16 @@ jobs:
       - name: Prepare the runner environment
         run: |
           set -euo pipefail
-          mkdir -p "$HOME"
+          # HOME is /nonexistent on the self-hosted runner, but on a hosted runner it
+          # holds the preinstalled toolchains. Only redirect it when it is unusable.
+          if [ ! -d "$HOME" ] || [ ! -w "$HOME" ]; then
+            HOME="$GITHUB_WORKSPACE/.home"
+            mkdir -p "$HOME"
+            export HOME
+            echo "HOME=$HOME" >> "$GITHUB_ENV"
+            echo "Redirected HOME to $HOME"
+          fi
+          echo "HOME=$HOME"
           missing=""
           for tool in kubectl python3; do
             command -v "$tool" > /dev/null 2>&1 || missing="$missing $tool"
