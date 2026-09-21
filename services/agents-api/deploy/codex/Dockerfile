@@ -1,6 +1,11 @@
 # Build context is a prepared binary bundle, never the product checkout.
 # Native package and resources must both be Codex 0.153.4 (linux/amd64).
-FROM debian:bookworm-slim@sha256:a0982977ea1cf754c15281f48a7d5957cd14039a2a4f2aca9f23d74d226003d0
+# Fork deviation from the upstream pin, recorded deliberately: the previous digest
+# (a0982977...003d) no longer resolves on Docker Hub, so the build could not run at
+# all. This digest is the bookworm-slim that sandbaseai/new-api builds from today.
+# The Docker and E2B qualification evidence was produced against the old base, so
+# this base has not been re-qualified.
+FROM debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates bash git python3 python3-pip nodejs npm ripgrep bubblewrap \
     && rm -rf /var/lib/apt/lists/* \

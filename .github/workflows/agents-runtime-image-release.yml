@@ -22,6 +22,11 @@ name: agents runtime image
 on:
   workflow_dispatch:
     inputs:
+      runner:
+        description: "Runner label. Defaults to vars.AGENTS_CI_RUNNER, then ubuntu-latest"
+        required: false
+        default: ""
+        type: string
       registry:
         description: "Registry host"
         required: false
@@ -60,24 +65,91 @@ env:
 
 jobs:
   image:
-    # scripts/build-agents-executor.sh refuses any host other than Linux x86_64.
-    runs-on: ubuntu-latest
+    # Hosted runner, matching new-api: the registry and the cluster API are both
+    # reachable from it. Override with the runner input or vars.AGENTS_CI_RUNNER to
+    # use the self-hosted runner instead; its HOME is /nonexistent, which is why
+    # every tool that would write there gets an explicit workspace path below.
+    runs-on: ${{ inputs.runner || vars.AGENTS_CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 60
     env:
+      HOME: ${{ github.workspace }}/.home
       PARSAR_HOME: ${{ github.workspace }}/.parsar
+      # scripts/build-agents-executor.sh already points CARGO_HOME at PARSAR_HOME;
+      # rustup needs its own explicit directory for the pinned 1.95.0 toolchain.
+      RUSTUP_HOME: ${{ github.workspace }}/.parsar/cache/rustup
       REGISTRY: ${{ inputs.registry || 'useccr.ccs.tencentyun.com' }}
       NAMESPACE: ${{ inputs.namespace || 'sandbase' }}
       PUSH: ${{ inputs.push && 'true' || 'false' }}
     steps:
-      - name: Require an amd64 runner
+      - name: Prepare the runner environment
         run: |
           set -euo pipefail
           test "$(uname -s)/$(uname -m)" = "Linux/x86_64" \
-            || { echo "The executor and Runtime build require a Linux x86_64 runner." >&2; exit 1; }
+            || { echo "This build requires a Linux x86_64 runner." >&2; exit 1; }
+          # HOME is /nonexistent on this runner; create the workspace-scoped one that
+          # docker, go, cargo and npm will write into.
+          mkdir -p "$HOME"
+          echo "HOME=$HOME"
+          missing=""
+          for tool in docker python3 npm; do
+            command -v "$tool" > /dev/null 2>&1 || missing="$missing $tool"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required tools on the runner:$missing" >&2
+            exit 1
+          fi
+          docker version --format 'docker {{.Server.Version}} {{.Server.Os}}/{{.Server.Arch}}'
 
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+
+      - name: Ensure the pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUSTUP_HOME"
+          if command -v cargo > /dev/null 2>&1 && command -v rustup > /dev/null 2>&1; then
+            rustup --version
+            cargo --version
+            exit 0
+          fi
+          echo "rustup is not installed for this runner user; installing it into the workspace."
+          curl --proto '=https' --tlsv1.2 -sSfL https://sh.rustup.rs -o "$RUNNER_TEMP/rustup-init.sh"
+          # rust-toolchain.toml in packages/codex-executor pins the channel, so the
+          # installer only needs to provide rustup itself.
+          sh "$RUNNER_TEMP/rustup-init.sh" -y --no-modify-path --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" --version
+
+      - name: Resolve the pinned base images
+        run: |
+          set -euo pipefail
+          # Checked before the expensive Rust and Go builds: the qualified profile
+          # pins base images by digest, and a digest that no longer resolves on the
+          # registry fails the docker build minutes later for a reason unrelated to
+          # this repository. Report both pins, including the E2B template base, and
+          # the digest the floating tag currently points at.
+          codex_base="$(sed -n 's/^FROM \(.*\)$/\1/p' services/agents-api/deploy/codex/Dockerfile | head -1)"
+          e2b_base="$(sed -n "s/^BASE = '\(.*\)'$/\1/p" services/agents-api/deploy/e2b/build-template.py | head -1)"
+          status=0
+          for reference in "$codex_base" "$e2b_base"; do
+            if docker buildx imagetools inspect --format '{{.Name}}' "$reference" > /dev/null 2>&1; then
+              echo "resolved: $reference"
+            else
+              echo "MISSING:  $reference"
+              status=1
+            fi
+          done
+          echo "current debian:bookworm-slim:"
+          docker buildx imagetools inspect debian:bookworm-slim \
+            --format '{{.Manifest.Digest}}' 2>&1 | tail -1
+          echo "current node:22.23.1-bookworm-slim:"
+          docker buildx imagetools inspect node:22.23.1-bookworm-slim \
+            --format '{{.Manifest.Digest}}' 2>&1 | tail -1
+          if [ "$status" -ne 0 ]; then
+            echo "::error::A pinned base image digest no longer resolves. Re-pinning changes the qualified image, so decide that explicitly rather than floating the tag." >&2
+            exit 1
+          fi
 
       - uses: actions/setup-go@v7
         with:
