@@ -182,6 +182,8 @@ jobs:
           # Fail closed: a Core without its private configuration would start
           # without managed Runtime admission or reject every caller. Only key
           # names are read here; no secret value is fetched or printed.
+          # A Go template is not shell: these braces and $key belong to kubectl.
+          # shellcheck disable=SC2016
           kubectl -n "$K8S_NAMESPACE" get secret "$CONFIG_SECRET" \
             -o go-template='{{range $key, $value := .data}}{{$key}}{{"\n"}}{{end}}' > /tmp/config-keys
           required="keys.json execution-options.json"
@@ -193,6 +195,7 @@ jobs:
             grep -qx "$entry" /tmp/config-keys \
               || { echo "Secret $CONFIG_SECRET is missing key $entry." >&2; exit 1; }
           done
+          # shellcheck disable=SC2016
           kubectl -n "$K8S_NAMESPACE" get secret "$DATABASE_SECRET" \
             -o go-template='{{range $key, $value := .data}}{{$key}}{{"\n"}}{{end}}' \
             | grep -qx url \

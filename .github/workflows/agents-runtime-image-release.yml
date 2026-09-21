@@ -162,8 +162,10 @@ jobs:
           CCR_PASSWORD: ${{ secrets.CCR_PASSWORD }}
         run: |
           set -euo pipefail
-          test -n "$CCR_USERNAME" && test -n "$CCR_PASSWORD" \
-            || { echo "CCR_USERNAME and CCR_PASSWORD must be configured." >&2; exit 1; }
+          if [ -z "$CCR_USERNAME" ] || [ -z "$CCR_PASSWORD" ]; then
+            echo "CCR_USERNAME and CCR_PASSWORD must be configured." >&2
+            exit 1
+          fi
           # The CCR link intermittently times out its TLS handshake, as the
           # monorepo deployment already works around.
           for attempt in 1 2 3 4 5; do
